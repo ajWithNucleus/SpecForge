@@ -381,6 +381,13 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+
+    # For shared head models, also load and freeze the lm_head from target
+    if hasattr(draft_model, 'load_lm_head'):
+        print_on_rank0("Loading and freezing lm_head from target model (shared head variant)")
+        draft_model.load_lm_head(args.target_model_path, lm_head_key=args.lm_head_key)
+        draft_model.freeze_lm_head()
+
     return draft_model_config, draft_model
 
 

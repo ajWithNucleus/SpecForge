@@ -11,13 +11,47 @@ import triton
 import triton.language as tl
 
 
-# Reference implementation
+# Reference implementation for forward KL / cross-entropy (off-policy distillation)
 @torch.compile(dynamic=None)
 def _compute_loss(logits, target_p, position_mask):
+    """
+    Compute forward KL / cross-entropy loss: -Σ target_p(x) · log student_p(x)
+
+    This is the standard off-policy distillation loss.
+    """
     logits = logits.float()
     out_logp = nn.LogSoftmax(dim=2)(logits)
     plogp = target_p * out_logp
     loss = -torch.sum(position_mask * plogp, 2).mean()
+    return loss
+
+
+# Reference implementation for reverse KL (on-policy distillation)
+@torch.compile(dynamic=None)
+def _compute_reverse_kl_loss(logits, target_p, position_mask, eps=1e-8):
+    """
+    Compute reverse KL divergence: KL(student || teacher)
+
+    This is the on-policy distillation loss as described in:
+    https://thinkingmachines.ai/blog/on-policy-distillation/
+
+    Args:
+        logits: student model logits (B, T, V)
+        target_p: teacher probability distribution (B, T, V), already softmax'd
+        position_mask: mask for valid positions (B, T, 1)
+        eps: small constant for numerical stability in log
+
+    Loss = E_{x~student}[log student(x) - log teacher(x)]
+         = Σ student_p(x) · [log student_p(x) - log teacher_p(x)]
+    """
+    logits = logits.float()
+    student_log_p = nn.LogSoftmax(dim=2)(logits)
+    student_p = torch.exp(student_log_p)
+    teacher_log_p = torch.log(target_p + eps)
+
+    # Reverse KL: Σ p_student * (log p_student - log p_teacher)
+    kl = student_p * (student_log_p - teacher_log_p)
+    loss = torch.sum(position_mask * kl, 2).mean()
     return loss
 
 
@@ -44,6 +78,151 @@ def _calculate_settings(n):
         num_warps //= 2
 
     return BLOCK_SIZE, num_warps
+
+
+@triton.jit
+def reverse_kl_forward_kernel(
+    logits_ptr,
+    logits_stride,
+    target_ptr,
+    target_stride,
+    position_mask_ptr,
+    position_mask_stride,
+    loss_ptr,
+    loss_stride,
+    m_ptr,
+    d_ptr,
+    kl_ptr,
+    n_cols,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Forward kernel for reverse KL: KL(student || teacher)
+    Loss = Σ student_p * (log student_p - log teacher_p)
+    """
+    program_id = tl.program_id(0).to(tl.int64)
+    logits_ptr += program_id * logits_stride
+    target_ptr += program_id * target_stride
+    position_mask_ptr += program_id * position_mask_stride
+    position_mask = tl.load(position_mask_ptr)
+    if position_mask == 0:
+        return
+
+    m = float("-inf")
+    d = 0.0
+
+    # First pass: compute max and sum for softmax normalization
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        logits_block = tl.load(
+            logits_ptr + offsets, mask=mask, other=float("-inf")
+        ).cast(tl.float32)
+        block_max = tl.max(tl.where(mask, logits_block, float("-inf")))
+        m_new = tl.maximum(m, block_max)
+        d = d * tl.exp(m - m_new) + tl.sum(
+            tl.where(mask, tl.exp(logits_block - m_new), 0.0)
+        )
+        m = m_new
+
+    log_normalizer = tl.log(d)
+
+    # Second pass: compute KL divergence
+    kl = 0.0
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        logits_block = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(
+            tl.float32
+        )
+        target_block = tl.load(target_ptr + offsets, mask=mask, other=0.0).cast(
+            tl.float32
+        )
+
+        # student_log_p = logits - m - log(d)
+        student_log_p = logits_block - m - log_normalizer
+        student_p = tl.exp(student_log_p)
+
+        # teacher_log_p = log(target + eps)
+        teacher_log_p = tl.log(target_block + eps)
+
+        # KL contribution: p * (log p - log q)
+        kl_contribution = student_p * (student_log_p - teacher_log_p)
+        kl += tl.sum(tl.where(mask, kl_contribution, 0.0))
+
+    loss_ptr += program_id * loss_stride
+    m_ptr += program_id
+    d_ptr += program_id
+    kl_ptr += program_id
+    tl.store(loss_ptr, kl)
+    tl.store(m_ptr, m.to(tl.float32))
+    tl.store(d_ptr, d.to(tl.float32))
+    tl.store(kl_ptr, kl.to(tl.float32))
+
+
+@triton.jit
+def reverse_kl_backward_kernel(
+    logits_ptr,
+    logits_stride,
+    target_ptr,
+    target_stride,
+    position_mask_ptr,
+    grad_output_ptr,
+    scaling_factor,
+    m_ptr,
+    d_ptr,
+    kl_ptr,
+    n_cols,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Backward kernel for reverse KL.
+    Gradient: p * (log p - log q - KL)
+    """
+    program_id = tl.program_id(0).to(tl.int64)
+    logits_ptr += program_id * logits_stride
+    target_ptr += program_id * target_stride
+    position_mask_ptr += program_id
+
+    position_mask = tl.load(position_mask_ptr)
+    if position_mask == 0:
+        for i in range(0, n_cols, BLOCK_SIZE):
+            offsets = i + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_cols
+            tl.store(logits_ptr + offsets, 0.0, mask=mask)
+        return
+
+    m_ptr += program_id
+    d_ptr += program_id
+    kl_ptr += program_id
+    m = tl.load(m_ptr).to(tl.float32)
+    d = tl.load(d_ptr).to(tl.float32)
+    kl = tl.load(kl_ptr).to(tl.float32)
+    grad_output = tl.load(grad_output_ptr).to(tl.float32)
+    grad_output = grad_output * scaling_factor
+
+    log_normalizer = tl.log(d)
+
+    # Compute gradients: p * (log p - log q - KL) * grad_output
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        logits_block = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(
+            tl.float32
+        )
+        target_block = tl.load(target_ptr + offsets, mask=mask, other=0.0).cast(
+            tl.float32
+        )
+
+        student_log_p = logits_block - m - log_normalizer
+        student_p = tl.exp(student_log_p)
+        teacher_log_p = tl.log(target_block + eps)
+
+        # grad = p * (log p - log q - KL)
+        grad_block = student_p * (student_log_p - teacher_log_p - kl) * grad_output
+        tl.store(logits_ptr + offsets, grad_block.to(tl.float32), mask=mask)
 
 
 @triton.jit
@@ -171,6 +350,8 @@ def log_softmax_backward_kernel(
 
 
 class LogSoftmaxLoss(torch.autograd.Function):
+    """Forward KL / cross-entropy loss (off-policy distillation)."""
+
     @staticmethod
     def forward(ctx, logits, target, position_mask):
         B, T, V = logits.shape
@@ -228,13 +409,89 @@ class LogSoftmaxLoss(torch.autograd.Function):
         return logits, None, None, None, None
 
 
+class ReverseKLLoss(torch.autograd.Function):
+    """
+    Reverse KL loss (on-policy distillation).
+
+    This implements KL(student || teacher) as described in:
+    https://thinkingmachines.ai/blog/on-policy-distillation/
+
+    Loss = Σ student_p(x) · [log student_p(x) - log teacher_p(x)]
+    """
+
+    EPS = 1e-8
+
+    @staticmethod
+    def forward(ctx, logits, target, position_mask):
+        B, T, V = logits.shape
+        loss = torch.zeros((B * T, 1), device=logits.device)
+        logits_flat = logits.contiguous().view(B * T, V)
+        target_flat = target.contiguous().view(B * T, V)
+        position_mask_flat = position_mask.contiguous().view(B * T, 1).bool()
+        grid = (B * T,)
+        m = torch.zeros((B * T,), device=logits.device, dtype=torch.float32)
+        d = torch.zeros((B * T,), device=logits.device, dtype=torch.float32)
+        kl = torch.zeros((B * T,), device=logits.device, dtype=torch.float32)
+        BLOCK_SIZE, num_warps = _calculate_settings(V)
+        reverse_kl_forward_kernel[grid](
+            logits_flat,
+            logits_flat.stride(0),
+            target_flat,
+            target_flat.stride(0),
+            position_mask_flat,
+            position_mask_flat.stride(0),
+            loss,
+            loss.stride(0),
+            m,
+            d,
+            kl,
+            V,
+            eps=ReverseKLLoss.EPS,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+        ctx.save_for_backward(logits.detach(), target, position_mask, m, d, kl)
+        return loss.squeeze(1).mean()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, target, position_mask, m, d, kl = ctx.saved_tensors
+        B, T, V = logits.shape
+        scaling_factor = 1.0 / (B * T)
+        logits = logits.contiguous().view(B * T, V)
+        target = target.contiguous().view(B * T, V)
+        position_mask = position_mask.contiguous().view(B * T, 1).bool()
+        grid = (B * T,)
+        BLOCK_SIZE, num_warps = _calculate_settings(V)
+        reverse_kl_backward_kernel[grid](
+            logits,
+            logits.stride(0),
+            target,
+            target.stride(0),
+            position_mask,
+            grad_output,
+            scaling_factor,
+            m,
+            d,
+            kl,
+            V,
+            eps=ReverseKLLoss.EPS,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+        logits = logits.view(B, T, V)
+        return logits, None, None, None, None
+
+
 if __name__ == "__main__":
     device = "cuda"
     B, T, V = 1, 1024, 16000
+
+    # Test forward KL (off-policy) loss
+    print("Testing forward KL (off-policy) loss...")
     logits = torch.randn(B, T, V, device=device, requires_grad=True)
     logits2 = logits.clone().detach().requires_grad_(True)
     target = torch.randn(B, T, V, device=device)
-    position_mask = torch.randint(0, 2, (B, T, 1), dtype=torch.bool, device=device)
     position_mask = torch.ones((B, T, 1), dtype=torch.bool, device=device)
     output1 = LogSoftmaxLoss.apply(logits, target, position_mask)
     output2 = _compute_loss(logits2, target, position_mask)
@@ -242,3 +499,21 @@ if __name__ == "__main__":
     output1.backward()
     output2.backward()
     torch.testing.assert_close(logits.grad, logits2.grad, rtol=1e-4, atol=1e-4)
+    print("Forward KL loss test passed!")
+
+    # Test reverse KL (on-policy) loss
+    print("Testing reverse KL (on-policy) loss...")
+    logits3 = torch.randn(B, T, V, device=device, requires_grad=True)
+    logits4 = logits3.clone().detach().requires_grad_(True)
+    # target_p should be a valid probability distribution (softmax'd)
+    target_p = nn.Softmax(dim=2)(torch.randn(B, T, V, device=device))
+    position_mask = torch.ones((B, T, 1), dtype=torch.bool, device=device)
+    output3 = ReverseKLLoss.apply(logits3, target_p, position_mask)
+    output4 = _compute_reverse_kl_loss(logits4, target_p, position_mask)
+    torch.testing.assert_close(output3, output4, rtol=1e-4, atol=1e-4)
+    output3.backward()
+    output4.backward()
+    torch.testing.assert_close(logits3.grad, logits4.grad, rtol=1e-4, atol=1e-4)
+    print("Reverse KL loss test passed!")
+
+    print("\nAll tests passed!")

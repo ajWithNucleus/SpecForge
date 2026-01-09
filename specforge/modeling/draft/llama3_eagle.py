@@ -1,4 +1,5 @@
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -1349,6 +1350,233 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+
+class LlamaForCausalLMEagle3SharedHead(Eagle3DraftModel):
+    """
+    Eagle3 draft model variant that shares the vocabulary and lm_head with the target model.
+
+    Key differences from LlamaForCausalLMEagle3:
+    1. Uses the full target vocabulary instead of a reduced draft vocabulary
+    2. The lm_head is loaded from the target model and frozen during training
+    3. No vocabulary mapping (t2d/d2t) is needed since vocab is shared
+
+    Usage:
+        # Create model with full vocab size
+        config = LlamaConfig(vocab_size=128256, draft_vocab_size=128256, ...)
+        draft_model = LlamaForCausalLMEagle3SharedHead(config)
+
+        # Load and freeze both embedding and lm_head from target
+        draft_model.load_embedding(target_model_path)
+        draft_model.freeze_embedding()
+        draft_model.load_lm_head(target_model_path)
+        draft_model.freeze_lm_head()
+    """
+
+    config_class = LlamaConfig
+
+    def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
+        super().__init__(config)
+        self.config = config
+        self.quant_config = quant_config
+
+        self.vocab_size = config.vocab_size
+        # For shared head, draft_vocab_size should equal vocab_size
+        self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
+
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
+        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+
+        if hasattr(config, "target_hidden_size"):
+            self.fc = torch.nn.Linear(
+                config.target_hidden_size * 3, config.hidden_size, bias=False
+            )
+        else:
+            self.fc = torch.nn.Linear(
+                config.hidden_size * 3, config.hidden_size, bias=False
+            )
+
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # lm_head uses full vocab size (same as target model)
+        self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
+
+        # For shared head, t2d is identity mapping (all True) and d2t is identity
+        t2d = torch.ones(self.vocab_size, dtype=torch.bool)
+        d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
+        self.register_buffer("t2d", t2d)
+        self.register_buffer("d2t", d2t)
+
+        # Mark that vocab mapping is already set (identity mapping)
+        self.vocab_mapping_loaded = True
+
+    def load_vocab_mapping(self, file_path: str) -> None:
+        """
+        Override to skip vocab mapping loading for shared head model.
+        The shared head model uses identity mapping by default.
+        """
+        # No-op for shared head model since we use full vocab
+        pass
+
+    @torch.no_grad()
+    def load_lm_head(
+        self, model_path: str, lm_head_key: str = "lm_head.weight"
+    ) -> None:
+        """
+        Load the lm_head weights from the target model.
+
+        Args:
+            model_path (str): Path to the target model. Can be either a Hugging Face
+                repository ID or a local directory path containing the model files.
+            lm_head_key (str): The key of the lm_head weight in the state dict.
+        """
+        import glob
+        import json
+        from safetensors import safe_open
+
+        if os.path.exists(model_path):
+            # model_path is a local directory
+            # check if there is file ending with index.json
+            glob_path = os.path.join(model_path, "*.index.json")
+            index_json_path = glob.glob(glob_path)
+
+            if len(index_json_path) == 0:
+                # No index.json found, look for single model file
+                safetensors_path = os.path.join(model_path, "model.safetensors")
+                if os.path.exists(safetensors_path):
+                    with safe_open(safetensors_path, framework="pt") as f:
+                        self.lm_head.weight.copy_(f.get_tensor(lm_head_key))
+                    return
+
+                pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
+                if os.path.exists(pytorch_model_path):
+                    state_dict = torch.load(pytorch_model_path, map_location="cpu")
+                    self.lm_head.weight.copy_(state_dict[lm_head_key])
+                    return
+
+                raise FileNotFoundError(
+                    f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
+                )
+            if len(index_json_path) > 1:
+                raise FileNotFoundError(
+                    f"Multiple index.json files found in {model_path}"
+                )
+            index_json_path = index_json_path[0]
+
+            with open(index_json_path, "r") as f:
+                index_json = json.load(f)
+            ckpt_file = index_json["weight_map"][lm_head_key]
+
+            if ckpt_file.endswith(".safetensors"):
+                with safe_open(
+                    os.path.join(model_path, ckpt_file), framework="pt"
+                ) as f:
+                    lm_head_weights = f.get_tensor(lm_head_key)
+            else:
+                state_dict = torch.load(os.path.join(model_path, ckpt_file))
+                lm_head_weights = state_dict[lm_head_key]
+            self.lm_head.weight.copy_(lm_head_weights)
+        else:
+            # this is the case where model_path is a huggingface repository
+            # we first need to locate its local cache
+            from huggingface_hub import snapshot_download
+            local_cache_path = snapshot_download(repo_id=model_path)
+            self.load_lm_head(local_cache_path, lm_head_key)
+
+    def freeze_lm_head(self) -> None:
+        """
+        Freeze the lm_head weights so they are not updated during training.
+        """
+        self.lm_head.weight.requires_grad = False
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        ttt_length: int = 1,
+    ):
+        """
+        Arguments:
+            hidden_states: input to the layer, cat low, mid high hidden_states of shape (batch, seq_len, hidden_states * 3)
+            inputs_embeds: embedded input ids of shape (batch, seq_len, hidden_size)
+            attention_mask: attention mask of size (batch, 1, tgt_len, src_len)
+            ttt_length: TTT length for caching hidden states
+        """
+        if ttt_length == 1:
+            print_with_rank("using ttt_length 1, no need to cache hidden states")
+            cache_hidden = None
+        else:
+            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
+            cache_hidden = [[], []]
+
+        batch_size, seq_length, _ = hidden_states.size()
+
+        # make position ids
+        device = hidden_states.device
+        position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+
+        # make attention mask
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
+            )
+        attention_mask = prepare_decoder_attention_mask(
+            attention_mask, (batch_size, seq_length), hidden_states, 0
+        )
+
+        # fc
+        hidden_states = self.fc(hidden_states)
+        hidden_states = self.midlayer(
+            input_emb=inputs_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            output_attentions=False,
+            use_cache=False,
+        )
+
+        # norm
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # eagle 3 requires hidden states from 3 layers
+        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        return self.fc(hidden_states)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        norm_hidden_states = self.norm(hidden_states)
+        return self.lm_head(norm_hidden_states)
+
+    def backbone(
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        return self.midlayer(
+            input_emb=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            output_attentions=False,
+            use_cache=False,
+        )
 
     def forward(
         self,

@@ -114,6 +114,79 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         self.embed_tokens.weight.requires_grad = False
 
+    def freeze_lm_head(self) -> None:
+        """
+        Freeze the lm_head of the draft model so that it is not updated during training.
+        This is typically used when sharing the lm_head with the target model.
+        """
+        if hasattr(self, "lm_head"):
+            self.lm_head.weight.requires_grad = False
+            if hasattr(self.lm_head, "bias") and self.lm_head.bias is not None:
+                self.lm_head.bias.requires_grad = False
+
+    @torch.no_grad()
+    def load_lm_head(
+        self, model_path: str, lm_head_key: str = "lm_head.weight"
+    ) -> None:
+        """
+        Load the lm_head weights from the target model.
+
+        Args:
+            model_path (str): Path to the target model. Can be either a Hugging Face
+            repository ID or a local directory path containing the model files.
+            lm_head_key (str): The key of the lm_head weight in the model checkpoint.
+        """
+        if not hasattr(self, "lm_head"):
+            raise AttributeError(
+                "lm_head not found in the draft model. Make sure the model has an lm_head attribute."
+            )
+
+        if os.path.exists(model_path):
+            # model_path is a local directory
+            glob_path = os.path.join(model_path, "*.index.json")
+            index_json_path = glob.glob(glob_path)
+
+            if len(index_json_path) == 0:
+                # No index.json found, look for single model file
+                safetensors_path = os.path.join(model_path, "model.safetensors")
+                if os.path.exists(safetensors_path):
+                    with safe_open(safetensors_path, framework="pt") as f:
+                        self.lm_head.weight.copy_(f.get_tensor(lm_head_key))
+                    return
+
+                pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
+                if os.path.exists(pytorch_model_path):
+                    state_dict = torch.load(pytorch_model_path, map_location="cpu")
+                    self.lm_head.weight.copy_(state_dict[lm_head_key])
+                    return
+
+                raise FileNotFoundError(
+                    f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
+                )
+            if len(index_json_path) > 1:
+                raise FileNotFoundError(
+                    f"Multiple index.json files found in {model_path}"
+                )
+            index_json_path = index_json_path[0]
+
+            with open(index_json_path, "r") as f:
+                index_json = json.load(f)
+            ckpt_file = index_json["weight_map"][lm_head_key]
+
+            if ckpt_file.endswith(".safetensors"):
+                with safe_open(
+                    os.path.join(model_path, ckpt_file), framework="pt"
+                ) as f:
+                    lm_head_weight = f.get_tensor(lm_head_key)
+            else:
+                state_dict = torch.load(os.path.join(model_path, ckpt_file))
+                lm_head_weight = state_dict[lm_head_key]
+            self.lm_head.weight.copy_(lm_head_weight)
+        else:
+            # this is the case where model_path is a huggingface repository
+            local_cache_path = snapshot_download(repo_id=model_path)
+            self.load_lm_head(local_cache_path, lm_head_key)
+
     @torch.no_grad()
     def load_embedding(
         self, model_path: str, embedding_key: str = "model.embed_tokens.weight"

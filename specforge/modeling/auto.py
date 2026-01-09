@@ -18,7 +18,7 @@ from transformers import (
     modeling_utils,
 )
 
-from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .draft.llama3_eagle import LlamaForCausalLMEagle3, LlamaForCausalLMEagle3SharedHead
 from .target.custom_backend import (
     GptOssForCausalLM,
     Llama4ForCausalLM,
@@ -28,6 +28,12 @@ from .target.custom_backend import (
     Qwen3ForCausalLM,
     Qwen3MoeForCausalLM,
 )
+
+
+# Mapping from architecture name to model class for shared head models
+_SHARED_HEAD_MODEL_MAPPING = {
+    "LlamaForCausalLMEagle3SharedHead": LlamaForCausalLMEagle3SharedHead,
+}
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
@@ -48,7 +54,18 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         Returns:
             A model instance.
         """
-        # get the model class from the
+        # Check if the architecture specifies a shared head model
+        architectures = getattr(config, "architectures", None)
+        if architectures and len(architectures) == 1:
+            arch_name = architectures[0]
+            if arch_name in _SHARED_HEAD_MODEL_MAPPING:
+                _model_cls = _SHARED_HEAD_MODEL_MAPPING[arch_name]
+                model = _model_cls(config, **config_kwargs)
+                if torch_dtype is not None:
+                    model = model.to(dtype=torch_dtype)
+                return model
+
+        # get the model class from the config type mapping
         _model_cls = cls._model_mapping[type(config)]
         model = _model_cls(config, **config_kwargs)
 
@@ -133,6 +150,7 @@ class AutoDraftModelConfig:
 
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
+        "LlamaForCausalLMEagle3SharedHead": LlamaConfig,
     }
 
     @classmethod

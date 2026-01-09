@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 from yunchang import EXTRACT_FUNC_DICT
 
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import LogSoftmaxLoss, ReverseKLLoss
 from specforge.distributed import (
     gather_outputs_and_unpad,
     get_sp_ring_group,
@@ -59,17 +59,33 @@ class OnlineEagle3Model(Eagle3Model):
         draft_model: Eagle3DraftModel,
         length: int = 7,
         attention_backend="sdpa",
+        loss_type: str = "forward_kl",
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            loss_type: Type of distillation loss to use.
+                - "forward_kl": Standard forward KL / cross-entropy (off-policy distillation)
+                - "reverse_kl": Reverse KL divergence (on-policy distillation)
+                  See: https://thinkingmachines.ai/blog/on-policy-distillation/
         """
         super().__init__()
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
+        self.loss_type = loss_type
+
+        # Select loss function based on loss_type
+        if loss_type == "forward_kl":
+            self.loss_fn = LogSoftmaxLoss
+        elif loss_type == "reverse_kl":
+            self.loss_fn = ReverseKLLoss
+        else:
+            raise ValueError(
+                f"Unknown loss_type: {loss_type}. Must be 'forward_kl' or 'reverse_kl'."
+            )
 
         if self.attention_backend == "usp":
             self.extract_func = EXTRACT_FUNC_DICT["basic"]
@@ -218,7 +234,7 @@ class OnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            loss = self.loss_fn.apply(logits, target_p, position_mask)
             plosses.append(loss)
 
             if not is_last:
@@ -249,12 +265,17 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         processor,
         length: int = 7,
         attention_backend: str = "sdpa",
+        loss_type: str = "forward_kl",
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            loss_type: Type of distillation loss to use.
+                - "forward_kl": Standard forward KL / cross-entropy (off-policy distillation)
+                - "reverse_kl": Reverse KL divergence (on-policy distillation)
+                  See: https://thinkingmachines.ai/blog/on-policy-distillation/
         """
         super().__init__()
         self.target_model = target_model
@@ -262,6 +283,17 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.processor = processor
         self.length = length
         self.attention_backend = attention_backend
+        self.loss_type = loss_type
+
+        # Select loss function based on loss_type
+        if loss_type == "forward_kl":
+            self.loss_fn = LogSoftmaxLoss
+        elif loss_type == "reverse_kl":
+            self.loss_fn = ReverseKLLoss
+        else:
+            raise ValueError(
+                f"Unknown loss_type: {loss_type}. Must be 'forward_kl' or 'reverse_kl'."
+            )
 
     @torch.no_grad()
     def _prepare_data(
@@ -509,7 +541,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            loss = self.loss_fn.apply(logits, target_p, position_mask)
             plosses.append(loss)
 
             if not is_last:
